@@ -136,3 +136,144 @@ MIT (see [LICENSE](./LICENSE))
 
 - [`superpowers:santa-method`](https://github.com/anthropics/claude-skills) — dual-reviewer convergence pattern
 - [`everything-claude-code:codex`](https://github.com/anthropics/claude-skills) — Codex CLI integration patterns
+
+---
+
+# xview — Claude Code 多 agent 对抗评审 skill 集
+
+两个 Claude Code skill，强制**双 reviewer 收敛**做计划评审和 PR 评审：
+
+- **`/xplanview <issue#>`** — 在写代码**之前**评审实施方案，状态持久化到 GitHub issue
+- **`/xprview <PR#>`** — 评审已开 PR 的 diff，由 Sonnet 自动改代码，状态持久化到 PR 评论 + commit
+
+两者执行同一条收敛规则：
+
+> **必须有两个不同的 agent 都对同一份 artifact 给出 PASS 才算收敛。1 个 PASS 不够 —— 自己审自己不算评审。**
+
+灵感来自 [`superpowers:santa-method`](https://github.com/anthropics/claude-skills) 的双 reviewer 模式，扩展了 GitHub 持久化和按版本/SHA 跟踪 PASS 状态。
+
+## 为什么要两个 reviewer
+
+单 reviewer 给出 PASS 等于在用自己的分析评审自己的分析 —— 信号不够。要求**两个不同模型族**（Anthropic Claude Opus + OpenAI Codex CLI）对同一份修订都 PASS，才能加入独立判断 —— 它们能抓不同类别的 bug，而能同时通过两边的 defect 大概率是真的没问题。
+
+## 两个 skill 各自做什么
+
+### `xplanview` — 计划评审
+
+- **Reviewer**：Opus（subagent）+ Codex（`codex exec`），严格交替 R1/R2/R3/R4
+- **Fixer**：主 Claude 会话直接写修订（只动文本，不动代码）
+- **收敛条件**：两 reviewer 都对同一 `v{N}` 计划版本 PASS
+- **持久化**：GitHub issue 评论，HTML marker（`<!-- xplanview:plan:v1 -->`、`<!-- xplanview:review:r{N}:{reviewer}:v{V} -->` 等）
+- **最多 4 轮**，未收敛则升级给用户决策
+
+### `xprview` — PR 评审 + 自动修复
+
+- **Reviewer**：Codex + Opus 严格交替
+- **Fixer**：Sonnet 4.6 subagent（角色分离 —— 只改代码、commit、push，不参与评审）
+- **收敛条件**：两 reviewer 都对同一 HEAD SHA PASS
+- **持久化**：PR 评论 + git commit（"xprview r{N} fix: ..."）+ PR description 收敛轨迹
+- **仅支持同仓库 PR**（fork PR 因无 origin push 权限会早期升级）
+- **最多 4 轮 review + 3 轮 sonnet fix**
+
+## 安装
+
+### 前置要求
+
+- [Claude Code](https://docs.claude.com/claude-code)（skill 从 `~/.claude/skills/<name>/SKILL.md` 自动注册为 slash command）
+- [`gh` CLI](https://cli.github.com/) 已认证（`gh auth status`）
+- [`codex` CLI](https://github.com/openai/codex) 已安装（`which codex`）—— 用作第二 reviewer
+- `jq` 已安装
+- 仅 `xprview` 需要：一个开着的同仓库 PR + `npm run lint` / `npm test`（没有也可，会自动跳过门禁）
+
+### 安装命令
+
+```bash
+git clone https://github.com/byron-dowsure/xview.git
+mkdir -p ~/.claude/skills
+cp -r xview/xplanview xview/xprview ~/.claude/skills/
+```
+
+新开 Claude Code 会话验证：输入 `/xplan` 应能自动补全 `/xplanview`。
+
+## 使用
+
+### `/xplanview` —— 写代码前评审方案
+
+主会话 Claude 提出实施方案后，运行：
+
+```
+/xplanview              # 从当前分支推断 issue（如 cc/384-foo → #384）
+/xplanview 431          # 指定 issue
+/xplanview new          # 新建 issue 承载评审
+```
+
+Claude 会：
+
+1. 把方案以 `<!-- xplanview:plan:v1 -->` post 到 issue
+2. R1 Opus 评审 → 若 PASS 但 Codex 还没评 v1，进 R2 让 Codex 评**同一 v1**
+3. 两个都 PASS v1 → 收敛，退出
+4. 任一 FAIL → 写 v2（修订）→ R3 Opus 评 v2 → R4 Codex 评 v2 → ...
+5. 最多 4 轮；R4 仍未达到 2-of-2 PASS → 升级给用户决策
+
+### `/xprview` —— 评审 PR + 自动修复
+
+```
+/xprview                # 从当前分支推断 PR
+/xprview 123            # 指定 PR #123
+```
+
+Claude 会：
+
+1. 验证 PR 是 OPEN、同仓库、本地 worktree 干净 → checkout PR 分支
+2. Post baseline marker
+3. 交替评审：
+   - R1 Codex 评 baseline SHA → 若 PASS，R2 Opus 评同一 SHA → 双 PASS → 收敛
+   - 任一 FAIL → Sonnet subagent 读 FAIL review、改文件、返回
+   - 编排器跑 `npm run lint && npm test`（如 `package.json` 声明）
+   - Commit "xprview r{N} fix: ..." 并 push
+   - 进入下一轮评审
+4. 最多 4 轮；同一 HEAD SHA 未达到 2-of-2 PASS → 升级
+
+## Marker 协议（跨次运行如何追溯状态）
+
+skill 发的每条评论都以 HTML marker 开头，后续运行（或人）可以用 grep 找到具体 artifact。
+
+### xplanview（issue 评论）
+
+| Marker | 含义 |
+|---|---|
+| `<!-- xplanview:plan:v1 -->` | 原始方案 |
+| `<!-- xplanview:review:r{N}:{opus\|codex}:v{V} -->` | reviewer R 在第 N 轮评审了方案 v{V} |
+| `<!-- xplanview:revision:v{V+1} -->` | v{V} FAIL 后的修订 |
+| `<!-- xplanview:verdict:CONVERGED:r{N}:v{V} -->` | 终止：双 reviewer 都 PASS v{V} |
+| `<!-- xplanview:verdict:ESCALATE -->` | 终止：4 轮内未达成 2-of-2 PASS |
+
+### xprview（PR 评论）
+
+| Marker | 含义 |
+|---|---|
+| `<!-- xprview:baseline:{sha} -->` | skill 启动 |
+| `<!-- xprview:review:r{N}:{codex\|opus}:{sha} -->` | reviewer R 在第 N 轮评审了 HEAD={sha} |
+| `<!-- xprview:fix:r{N}:{new_sha} -->` | Sonnet 修复 → 新 commit {new_sha} |
+| `<!-- xprview:verdict:CONVERGED:r{N}:{sha} -->` | 终止：双 reviewer 都 PASS {sha} |
+| `<!-- xprview:verdict:ESCALATE -->` | 终止：失败 |
+
+## 成本与时长
+
+每次最坏情况：
+
+| Skill | 最坏调用次数 |
+|---|---|
+| `xplanview` | 4 次评审（2 Opus + 2 Codex）+ 3 次主会话修订 |
+| `xprview` | 4 次评审（2 Codex + 2 Opus）+ 3 次 Sonnet 修复 + lint/test |
+
+最佳情况：2 次评审（R1 + R2 都对同一 artifact PASS），无修订/修复。
+
+## License
+
+MIT（详见 [LICENSE](./LICENSE)）
+
+## 致谢
+
+- [`superpowers:santa-method`](https://github.com/anthropics/claude-skills) —— 双 reviewer 收敛模式
+- [`everything-claude-code:codex`](https://github.com/anthropics/claude-skills) —— Codex CLI 集成参考
